@@ -1,0 +1,338 @@
+# app.py
+import os
+import re
+import tempfile
+import uuid
+import math
+import shutil
+from pathlib import Path
+from typing import Tuple
+
+import numpy as np
+from scipy.io.wavfile import write as write_wav
+from pydub import AudioSegment
+from gtts import gTTS
+from transformers import pipeline, set_seed
+from langdetect import detect, DetectorFactory
+
+import gradio as gr
+from moviepy.editor import (
+    AudioFileClip,
+    ImageClip,
+    TextClip,
+    CompositeVideoClip,
+)
+
+# Make language detection deterministic
+DetectorFactory.seed = 0
+
+# ---------- Configuration ----------
+MODEL_NAME = "gpt2"  # Lightweight default. Replace with larger open models if available.
+SEED = 42
+set_seed(SEED)
+
+# Moderation: a simple blacklist of explicit sexual words/phrases.
+# This is intentionally conservative. Add/remove tokens as needed.
+EXPLICIT_PATTERNS = [
+    r"\bsex\b", r"\bporn\b", r"\bporno\b", r"\bnude\b", r"\bnudity\b",
+    r"\bexplicit\b", r"\berotic\b", r"\bxxx\b", r"\bfuck\b", r"\bmotherfucker\b",
+    r"\bblowjob\b", r"\bdildo\b", r"\bpussy\b", r"\bcock\b", r"\bpenis\b",
+    r"\bclit\b", r"\borgasm\b", r"\bhandjob\b", r"\bvoyeur\b", r"\bcunnilingus\b",
+    r"\bsexual act\b", r"\bbestiality\b", r"\bin porn\b", r"\bincest\b"
+]
+
+# Where outputs are saved
+OUT_DIR = Path("outputs")
+OUT_DIR.mkdir(exist_ok=True)
+
+# ---------- Helpers ----------
+
+def is_prompt_safe(prompt: str) -> Tuple[bool, str]:
+    """
+    Basic moderation: checks prompt against explicit patterns.
+    Returns (safe_bool, reason_if_not_safe)
+    """
+    text = prompt.lower()
+    for pat in EXPLICIT_PATTERNS:
+        if re.search(pat, text):
+            return False, "Your prompt contains explicit sexual content which this site does not allow. Please reword for romance/thriller/fantasy."
+    # block prompts that are extremely short or clearly nonsensical
+    if len(prompt.strip()) < 3:
+        return False, "Prompt too short. Please give a short description or idea."
+    return True, ""
+
+# Initialize text generation pipeline
+generator = pipeline("text-generation", model=MODEL_NAME, device=-1)  # CPU default. Use device=0 for GPU.
+
+def generate_story(prompt: str, lang: str = "en", max_length: int = 450) -> str:
+    """
+    Generate story text from prompt. We keep completions reasonably short.
+    """
+    # Prepend prompt with simple instructions to avoid explicit content
+    instruct = {
+        "en": "Write a tasteful, non-explicit short story in {}: ".format("English"),
+        "hi": "एक सुरुचिपूर्ण, गैर-वपुरुष (non-explicit) छोटी कहानी लिखें (हिंदी): ",
+        "ur": "ایک با ذوق، غیر واضح (non-explicit) مختصر کہانی لکھیں (اردو): ",
+    }
+    prefix = instruct.get(lang, instruct["en"])
+    prompt_full = prefix + prompt.strip()
+
+    # Generate using transformers pipeline
+    out = generator(prompt_full, max_length=max_length, num_return_sequences=1, do_sample=True, top_k=50, top_p=0.92)
+    text = out[0]["generated_text"]
+
+    # The model will repeat the prompt plus generated text; strip the prefix/prompt part
+    # Find the first occurrence of prompt (case-insensitive) and return what's after it, or return full text minus our prefix.
+    lowered = text.lower()
+    try:
+        # Attempt to find after the prompt_full
+        idx = lowered.find(prompt.strip().lower())
+        if idx != -1:
+            result = text[idx + len(prompt.strip()):].strip()
+        else:
+            # Fallback: remove the instruct prefix if present
+            if text.startswith(prefix):
+                result = text[len(prefix):].strip()
+            else:
+                result = text.strip()
+    except Exception:
+        result = text.strip()
+
+    # Post-filter: further remove explicit words if somehow present
+    for pat in EXPLICIT_PATTERNS:
+        result = re.sub(pat, "[redacted]", result, flags=re.IGNORECASE)
+
+    # If too short, regenerate with a larger max_length
+    if len(result.split()) < 50:
+        out = generator(prompt_full, max_length=650, num_return_sequences=1, do_sample=True, top_k=60, top_p=0.95)
+        result = out[0]["generated_text"]
+        if result.startswith(prefix):
+            result = result[len(prefix):]
+        for pat in EXPLICIT_PATTERNS:
+            result = re.sub(pat, "[redacted]", result, flags=re.IGNORECASE)
+
+    return result.strip()
+
+def synthesize_tts(text: str, lang_code: str, out_path: Path) -> Path:
+    """
+    Use gTTS to synthesize speech. gTTS supports 'en' and 'hi' reliably.
+    For Urdu, we will attempt 'ur'; if fails, fallback to 'hi' (Hindi) as a close phonetic alternative.
+    """
+    # gTTS language mapping
+    supported = {"en": "en", "hi": "hi", "ur": "ur"}
+    code = supported.get(lang_code, "en")
+    try:
+        tts = gTTS(text, lang=code)
+        tts.save(str(out_path))
+    except Exception as e:
+        # fallback to english if any error
+        tts = gTTS(text, lang="en")
+        tts.save(str(out_path))
+    return out_path
+
+def generate_pad_music(duration_sec: float, out_wav: Path, sr: int = 22050) -> Path:
+    """
+    Generate a simple ambient pad by mixing a few detuned sine waves and an amplitude envelope.
+    Writes a WAV file at out_wav
+    """
+    t = np.linspace(0, duration_sec, int(sr * duration_sec), endpoint=False)
+    # Base frequencies (simple ambient chord)
+    freqs = [220.0, 277.18, 329.63]  # A3, C#4, E4 (A major-ish)
+    signal = np.zeros_like(t)
+    for i, f in enumerate(freqs):
+        detune = f * (1.0 + (np.random.rand() - 0.5) * 0.002)  # tiny detune
+        signal += 0.25 * np.sin(2 * np.pi * detune * t)
+    # Lowpass-ish by simple smoothing (moving average)
+    kernel_size = 5
+    kernel = np.ones(kernel_size) / kernel_size
+    smooth = np.convolve(signal, kernel, mode="same")
+    # Amplitude envelope (fade in/out)
+    envelope = np.ones_like(t)
+    fade = int(0.05 * sr)
+    envelope[:fade] = np.linspace(0, 1, fade)
+    envelope[-fade:] = np.linspace(1, 0, fade)
+    sound = smooth * envelope * 0.6
+    # Normalize
+    sound = sound / (np.max(np.abs(sound)) + 1e-9)
+    waveform = (sound * 32767).astype(np.int16)
+    write_wav(str(out_wav), sr, waveform)
+    return out_wav
+
+def mix_audio(narration_wav: Path, music_wav: Path, out_path: Path, narration_gain_db: float = 0.0, music_gain_db: float = -8.0) -> Path:
+    """
+    Mix narration and music using pydub; returns combined wav path.
+    """
+    nat = AudioSegment.from_file(str(narration_wav))
+    mus = AudioSegment.from_file(str(music_wav))
+
+    # Loop or cut music to fit narration length
+    if len(mus) < len(nat):
+        mus = mus * (int(len(nat) / len(mus)) + 1)
+    mus = mus[:len(nat)]
+
+    # Apply gains
+    nat = nat + narration_gain_db
+    mus = mus + music_gain_db
+
+    combined = mus.overlay(nat)
+    combined.export(str(out_path), format="wav")
+    return out_path
+
+def make_video_with_subtitles(text: str, audio_path: Path, out_video: Path, lang: str = "en", width=720, height=1280, bg_color=(20, 20, 30)) -> Path:
+    """
+    Create a simple video: static colored background, text subtitles split in chunks, and combined audio.
+    """
+    # Create image clip (solid color)
+    bg_hex = "#%02x%02x%02x" % bg_color
+    img_clip = ImageClip(color=bg_hex, size=(width, height)).set_duration(5)  # placeholder
+
+    # Load audio to get duration
+    audio_clip = AudioFileClip(str(audio_path))
+    duration = audio_clip.duration
+
+    # Create final background clip with correct duration
+    img_clip = ImageClip(color=bg_hex, size=(width, height)).set_duration(duration)
+
+    # Prepare subtitle text: break into lines of ~10-12 words per screen
+    words = text.split()
+    per_screen = 12
+    chunks = [" ".join(words[i:i+per_screen]) for i in range(0, len(words), per_screen)]
+    txt_clips = []
+    t = 0.5
+    screen_time = max(2.0, duration / max(1, len(chunks)))  # distribute
+    for chunk in chunks:
+        txt = TextClip(chunk, fontsize=34, font="Arial-Bold", method="caption", size=(width-80, None), align="center")
+        txt = txt.set_position(("center", height * 0.75)).set_start(t).set_duration(screen_time)
+        txt_clips.append(txt)
+        t += screen_time
+
+    # Composite
+    final = CompositeVideoClip([img_clip, *txt_clips])
+    final = final.set_audio(audio_clip)
+    final.write_videofile(str(out_video), fps=24, codec="libx264", audio_codec="aac", threads=1, logger=None)
+    return out_video
+
+# ---------- Gradio app ----------
+
+def generate_pipeline(prompt: str, language: str, genre: str, title: str):
+    """
+    Main pipeline invoked by the UI.
+    """
+    # Safety check
+    safe, reason = is_prompt_safe(prompt)
+    if not safe:
+        return {
+            "status": "blocked",
+            "message": reason,
+            "story_text": "",
+            "audio_file": None,
+            "video_file": None,
+        }
+
+    # Normalize language codes
+    lang_code = {"English": "en", "Hindi": "hi", "Urdu": "ur"}.get(language, "en")
+
+    # Generate a story
+    combined_prompt = prompt
+    if genre:
+        combined_prompt = f"{genre}. {prompt}"
+    story = generate_story(combined_prompt, lang=lang_code, max_length=550)
+    if not story:
+        return {
+            "status": "error",
+            "message": "Failed to generate story. Try again with a different prompt.",
+            "story_text": "",
+            "audio_file": None,
+            "video_file": None,
+        }
+
+    # Prepare filenames
+    uid = uuid.uuid4().hex[:10]
+    base_dir = OUT_DIR / uid
+    base_dir.mkdir(parents=True, exist_ok=True)
+    story_txt_path = base_dir / f"{uid}_story.txt"
+    story_txt_path.write_text(story, encoding="utf-8")
+
+    # TTS to WAV
+    tts_path = base_dir / f"{uid}_narration.mp3"
+    try:
+        synthesize_tts(story, lang_code, tts_path)
+    except Exception as e:
+        # Attempt fallback to English TTS
+        synthesize_tts(story, "en", tts_path)
+
+    # Convert mp3 to wav (pydub)
+    narration_wav = base_dir / f"{uid}_narration.wav"
+    audio_seg = AudioSegment.from_file(str(tts_path))
+    audio_seg.export(str(narration_wav), format="wav")
+
+    # Generate background pad music WAV
+    music_wav = base_dir / f"{uid}_music.wav"
+    duration_seconds = math.ceil(AudioSegment.from_file(str(narration_wav)).duration_seconds) + 1.0
+    generate_pad_music(duration_seconds, music_wav)
+
+    # Mix audio
+    mixed_wav = base_dir / f"{uid}_mixed.wav"
+    mix_audio(narration_wav, music_wav, mixed_wav, narration_gain_db=0.0, music_gain_db=-10.0)
+
+    # Make final mp4 with subtitles
+    out_video = base_dir / f"{uid}_final.mp4"
+    try:
+        make_video_with_subtitles(story, mixed_wav, out_video, lang=lang_code)
+    except Exception as e:
+        # If video creation fails for any reason, return audio and text only
+        return {
+            "status": "partial",
+            "message": f"Story and audio generated but video creation failed: {e}",
+            "story_text": str(story_txt_path),
+            "audio_file": str(mixed_wav),
+            "video_file": None,
+        }
+
+    return {
+        "status": "ok",
+        "message": "Generated successfully",
+        "story_text": str(story_txt_path),
+        "audio_file": str(mixed_wav),
+        "video_file": str(out_video),
+    }
+
+# Gradio interface
+with gr.Blocks() as demo:
+    gr.Markdown("# Free Safe Story Generator (English / Hindi / Urdu)\n\nEnter a prompt. This site blocks sexually explicit prompts. Use romance, thriller, fantasy, drama, or general prompts.")
+    with gr.Row():
+        prompt_in = gr.Textbox(lines=3, label="Prompt (describe an idea, scene or theme)", placeholder="e.g. A rainy night in Old Delhi where two strangers meet...")
+        language = gr.Dropdown(["English", "Hindi", "Urdu"], value="English", label="Language")
+        genre = gr.Textbox(lines=1, label="Genre / Mood (optional)", placeholder="romance, thriller, fantasy, drama")
+        title = gr.Textbox(lines=1, label="Title (optional)", placeholder="An Unexpected Meeting")
+    generate_btn = gr.Button("Generate Story + Audio + Video")
+
+    status = gr.Textbox(label="Status", interactive=False)
+    story_out = gr.Textbox(lines=10, label="Generated Story (downloadable .txt link provided below)")
+    audio_file = gr.File(label="Mixed audio (narration + music)")
+    video_file = gr.File(label="Final MP4 video")
+
+    def on_generate(prompt, language, genre, title):
+        status.update(value="Working: generating... (may take up to a minute)")
+        result = generate_pipeline(prompt, language, genre, title)
+        if result["status"] == "blocked":
+            return result["message"], "", None, None
+        elif result["status"] in ("error",):
+            return result["message"], "", None, None
+        elif result["status"] == "partial":
+            message = result["message"]
+            story_txt = result["story_text"]
+            audio = result["audio_file"]
+            return message, Path(story_txt).read_text(encoding="utf-8"), audio, None
+        else:
+            story_txt = result["story_text"]
+            audio = result["audio_file"]
+            video = result["video_file"]
+            with open(story_txt, "r", encoding="utf-8") as f:
+                txt = f.read()
+            return result["message"], txt, audio, video
+
+    generate_btn.click(on_generate, inputs=[prompt_in, language, genre, title], outputs=[status, story_out, audio_file, video_file])
+
+if __name__ == "__main__":
+    demo.launch(server_name="0.0.0.0", server_port=7860)
